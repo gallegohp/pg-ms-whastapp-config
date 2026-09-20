@@ -27,6 +27,11 @@ class EnvioRequest(BaseModel):
     mensaje: str
 
 
+class CodigoRequest(BaseModel):
+    telefono: str
+    pais: str = os.getenv("WHATSAPP_DEFAULT_COUNTRY_NAME", "Colombia")
+
+
 @app.on_event("startup")
 def iniciar_cliente():
     def _run():
@@ -63,10 +68,28 @@ def obtener_qr():
     return FileResponse(QR_PATH, media_type="image/png")
 
 
+@app.post("/codigo")
+def solicitar_codigo(request: CodigoRequest):
+    """Pide un codigo de 8 caracteres para vincular el dispositivo con el
+    numero dado, como alternativa a escanear el QR de /qr. El codigo se
+    ingresa en el telefono en WhatsApp > Dispositivos vinculados > Vincular
+    un dispositivo > Vincular con numero de telefono."""
+    try:
+        codigo = client.solicitar_codigo(request.telefono, pais=request.pais)
+        return {"codigo": codigo}
+    except RuntimeError as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("Error solicitando codigo de vinculacion")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/debug/screenshot")
 def debug_screenshot():
-    """Endpoint temporal de diagnostico: captura la pagina completa tal cual
-    la ve Selenium, para depurar selectores cuando WhatsApp Web cambia su DOM."""
+    """Diagnostico de solo lectura: captura la pagina tal cual la ve
+    Selenium. No permite interactuar con la pagina (a diferencia de los
+    endpoints de click/type que existieron antes, se quitaron por ser un
+    riesgo si este puerto llegara a exponerse publicamente)."""
     if client.driver is None:
         raise HTTPException(status_code=409, detail="El driver no ha sido iniciado")
     path = "/app/data/debug.png"
@@ -79,53 +102,6 @@ def debug_html():
     if client.driver is None:
         raise HTTPException(status_code=409, detail="El driver no ha sido iniciado")
     return client.driver.page_source
-
-
-class ClickRequest(BaseModel):
-    selector: str
-    by: str = "css"
-
-
-class TypeRequest(BaseModel):
-    selector: str
-    text: str
-    by: str = "css"
-    enter: bool = False
-
-
-@app.post("/debug/click")
-def debug_click(request: ClickRequest):
-    from selenium.webdriver.common.by import By
-
-    by = By.XPATH if request.by == "xpath" else By.CSS_SELECTOR
-    el = client.driver.find_element(by, request.selector)
-    try:
-        el.click()
-    except Exception:
-        client.driver.execute_script("arguments[0].click();", el)
-    return {"ok": True}
-
-
-@app.post("/debug/type")
-def debug_type(request: TypeRequest):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-
-    by = By.XPATH if request.by == "xpath" else By.CSS_SELECTOR
-    el = client.driver.find_element(by, request.selector)
-    el.send_keys(request.text)
-    if request.enter:
-        el.send_keys(Keys.ENTER)
-    return {"ok": True}
-
-
-@app.get("/debug/text")
-def debug_text(selector: str, by: str = "css"):
-    from selenium.webdriver.common.by import By
-
-    by_type = By.XPATH if by == "xpath" else By.CSS_SELECTOR
-    els = client.driver.find_elements(by_type, selector)
-    return {"count": len(els), "texts": [e.text for e in els]}
 
 
 @app.post("/enviar")

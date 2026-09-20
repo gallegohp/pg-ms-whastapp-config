@@ -22,6 +22,12 @@ CHAT_LIST_SELECTOR = "div[aria-label='Chat list'], div[id='pane-side']"
 MESSAGE_BOX_SELECTOR = "div[contenteditable='true'][data-tab='10'], footer div[contenteditable='true']"
 SEND_BUTTON_SELECTOR = "button[aria-label='Send'], span[data-icon='send']"
 INVALID_NUMBER_TEXT = "Phone number shared via url is invalid"
+PHONE_NUMBER_SHORTCUT_SELECTOR = "[data-testid='link_device_qr_phone_number_shortcut_link']"
+PHONE_NUMBER_INPUT_SELECTOR = "[data-testid='phone-number-input']"
+LINK_CODE_CELLS_SELECTOR = "[data-testid='link-with-phone-number-code-cells']"
+COUNTRY_SELECTOR_BUTTON = "[data-testid='phone-number-country-selector']"
+COUNTRY_SEARCH_INPUT = "[data-testid='search-input']"
+COUNTRY_FIRST_RESULT = "[data-testid='list-item-0']"
 
 
 class WhatsAppWebClient:
@@ -90,11 +96,19 @@ class WhatsAppWebClient:
         ultimo_cambio = time.time()
         while True:
             try:
-                if self._chat_list_visible():
-                    self.logged_in = True
-                    logger.info("Sesion de WhatsApp Web activa.")
-                    return
-                if self._guardar_qr_si_existe():
+                # Sin este lock, este loop de fondo compite por la misma
+                # sesion de Selenium (una sola conexion HTTP a chromedriver)
+                # con cualquier llamada a estado()/enviar_mensaje()/
+                # solicitar_codigo(), causando comandos perdidos o
+                # entremezclados ("Connection pool is full, discarding
+                # connection") y navegaciones que parecen "revertirse" solas.
+                with self._lock:
+                    if self._chat_list_visible():
+                        self.logged_in = True
+                        logger.info("Sesion de WhatsApp Web activa.")
+                        return
+                    hay_qr = self._guardar_qr_si_existe()
+                if hay_qr:
                     with open(self.qr_path, "rb") as f:
                         actual = f.read()
                     if actual != ultimo_qr_bytes:
@@ -102,7 +116,8 @@ class WhatsAppWebClient:
                         ultimo_cambio = time.time()
                     elif time.time() - ultimo_cambio > qr_stale_segundos:
                         logger.info("QR estancado por %ss, recargando pagina...", qr_stale_segundos)
-                        self.driver.refresh()
+                        with self._lock:
+                            self.driver.refresh()
                         ultimo_qr_bytes = None
                         ultimo_cambio = time.time()
                         time.sleep(3)
@@ -175,3 +190,91 @@ class WhatsAppWebClient:
             return True
         except NoSuchElementException:
             return False
+
+    def solicitar_codigo(self, telefono: str, pais: str = "Colombia", timeout_segundos: int = 20) -> str:
+        """Pide un codigo de 8 caracteres para vincular el dispositivo usando el
+        numero de telefono, como alternativa a escanear el QR (util cuando no
+        hay forma comoda de mostrar una imagen, o cuando escanear falla por un
+        QR ya vencido). Solo tiene sentido si todavia no hay sesion activa.
+
+        `telefono` va sin el codigo de pais (WhatsApp lo agrega segun el pais
+        seleccionado). Al entrar a esta pantalla WhatsApp resuelve el pais por
+        defecto de forma asincrona (geolocalizacion): por un instante muestra
+        un pais transitorio incorrecto (en pruebas, "Greece") antes de asentarse
+        en el real. Por eso se espera a que el campo de telefono ya tenga un
+        prefijo antes de tocar nada, y ademas se selecciona el pais deseado
+        explicitamente (no basta con esperar, porque el default resuelto puede
+        no ser el que se quiere si el servidor esta en otro pais).
+
+        El codigo se lee directamente del atributo `data-link-code` del DOM en
+        vez de tomarlo de una captura de pantalla, para evitar errores de
+        lectura (p.ej. confundir O/0, I/1) en los caracteres mostrados.
+        """
+        if self.driver is None:
+            raise RuntimeError("El cliente de WhatsApp Web no ha sido iniciado")
+
+        with self._lock:
+            if self._chat_list_visible():
+                raise RuntimeError("Ya hay una sesion activa, no se necesita codigo")
+
+            wait = WebDriverWait(self.driver, timeout_segundos)
+
+            try:
+                atajo = wait.until(
+                    lambda d: d.find_element(By.CSS_SELECTOR, PHONE_NUMBER_SHORTCUT_SELECTOR)
+                )
+                self._click(atajo)
+            except TimeoutException:
+                # Puede que ya estemos en la pantalla de ingresar el numero
+                # (p.ej. si se llamo antes y quedo a mitad de camino).
+                logger.info("Atajo de 'vincular con numero' no visible, se asume que ya se paso esa pantalla.")
+
+            # Esperar a que se resuelva el pais transitorio antes de tocar el
+            # selector, o el click puede caer sobre el dropdown a mitad de un
+            # re-render y no abrir nada.
+            wait.until(
+                lambda d: (d.find_element(By.CSS_SELECTOR, PHONE_NUMBER_INPUT_SELECTOR).get_attribute("value") or "").strip().startswith("+")
+            )
+
+            selector_pais = wait.until(
+                lambda d: d.find_element(By.CSS_SELECTOR, COUNTRY_SELECTOR_BUTTON)
+            )
+            self._click(selector_pais)
+
+            busqueda = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, COUNTRY_SEARCH_INPUT))
+            busqueda.send_keys(pais)
+
+            def _resultado_filtrado(d):
+                # El primer item de la lista ya existe desde antes de escribir
+                # (con el listado sin filtrar), asi que no basta con esperar a
+                # que exista: hay que esperar a que su texto refleje el
+                # resultado de la busqueda, o se puede terminar seleccionando
+                # cualquier pais.
+                el = d.find_element(By.CSS_SELECTOR, COUNTRY_FIRST_RESULT)
+                return el if pais.lower() in el.text.lower() else False
+
+            primer_resultado = wait.until(_resultado_filtrado)
+            self._click(primer_resultado)
+
+            campo = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, PHONE_NUMBER_INPUT_SELECTOR))
+            # No se limpia el campo antes de escribir: un Ctrl+A + Delete aqui
+            # deja el campo "vacio" momentaneamente, lo que le hace perder el
+            # pais ya seleccionado (vuelve a mostrar el pais transitorio, p.ej.
+            # "Greece"). Como llegamos aqui con el campo recien inicializado,
+            # ya deberia estar vacio salvo por el prefijo del pais.
+            campo.send_keys(telefono)
+
+            boton = self.driver.find_element(By.XPATH, "//button[contains(., 'Next')]")
+            self._click(boton)
+
+            celdas = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, LINK_CODE_CELLS_SELECTOR))
+            crudo = celdas.get_attribute("data-link-code")  # ej: "T,7,R,J,R,B,R,4"
+            caracteres = crudo.split(",")
+            codigo = "".join(caracteres)
+            return f"{codigo[:4]}-{codigo[4:]}"
+
+    def _click(self, elemento):
+        try:
+            elemento.click()
+        except Exception:
+            self.driver.execute_script("arguments[0].click();", elemento)
