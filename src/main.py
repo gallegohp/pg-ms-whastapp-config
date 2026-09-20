@@ -84,6 +84,23 @@ def solicitar_codigo(request: CodigoRequest):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/reiniciar-sesion")
+def reiniciar_sesion():
+    """Cierra la sesion de WhatsApp Web actual y arranca una nueva desde cero,
+    para poder vincular un numero distinto al que esta activo (con /qr o
+    /codigo). No bloquea: la sesion vieja se cierra y el nuevo QR/codigo queda
+    listo en unos segundos, se puede consultar el progreso con /status."""
+
+    def _run():
+        try:
+            client.reiniciar_sesion()
+        except Exception:
+            logger.exception("Error reiniciando la sesion de WhatsApp Web")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "mensaje": "Reiniciando sesion. Consulta /status o pide un /codigo o /qr en unos segundos."}
+
+
 @app.get("/debug/screenshot")
 def debug_screenshot():
     """Diagnostico de solo lectura: captura la pagina tal cual la ve

@@ -87,6 +87,37 @@ class WhatsAppWebClient:
         logger.info("WhatsApp Web abierto, esperando sesion o QR...")
         self._esperar_sesion_o_qr()
 
+    def reiniciar_sesion(self):
+        """Cierra el navegador actual, borra el perfil de Chrome (con la sesion
+        de WhatsApp ya vinculada) y arranca desde cero para poder vincular un
+        numero distinto. Es sincrono y bloquea hasta que el nuevo QR/codigo
+        este listo para pedirse, asi que quien llame a esto debe correrlo en
+        un hilo de fondo (ver /reiniciar-sesion en main.py).
+
+        Nota: esto no hace "cerrar sesion" desde dentro de WhatsApp Web (no
+        hay boton de logout visible sin una sesion activa que se pueda perder
+        a medio camino), asi que el dispositivo viejo puede seguir apareciendo
+        en el telefono como "vinculado" hasta que WhatsApp lo expire solo o se
+        quite a mano desde Ajustes > Dispositivos vinculados.
+        """
+        import shutil
+
+        with self._lock:
+            if self.driver is not None:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    logger.exception("Error cerrando el driver anterior")
+            self.driver = None
+            self.logged_in = False
+            shutil.rmtree(self.profile_dir, ignore_errors=True)
+            os.makedirs(self.profile_dir, exist_ok=True)
+            if os.path.exists(self.qr_path):
+                os.remove(self.qr_path)
+
+        logger.info("Sesion reiniciada, arrancando de nuevo desde cero...")
+        self.iniciar()
+
     def _esperar_sesion_o_qr(self, qr_stale_segundos: int = 45):
         """Corre indefinidamente hasta que haya sesion activa. No tiene deadline
         porque este metodo corre en un hilo de fondo durante toda la vida del
